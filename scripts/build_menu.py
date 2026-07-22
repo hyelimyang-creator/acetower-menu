@@ -38,8 +38,8 @@ MOBILE_UA = (
     "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_PREFERRED = "gemini-2.5-flash"  # 이 키에서 접근 불가(404)면 아래 resolve_model이 대체 모델을 찾는다.
 GEMINI_SYSTEM = "당신은 한국 구내식당 메뉴판 이미지를 읽어 메뉴 항목만 정확히 추출하는 도우미입니다. 이미지에 없는 메뉴를 추측해서 지어내지 마세요."
 GEMINI_PROMPT = (
     "이 이미지는 어느 구내식당의 '오늘의 메뉴' 한 끼 메뉴판입니다. 메뉴 항목들을 이미지에 적힌 그대로 정확히 뽑아 "
@@ -94,6 +94,53 @@ def text_items(item):
     return [s.strip() for s in text.splitlines() if s.strip()]
 
 
+_MODEL_CACHE = {}
+
+
+def resolve_model(api_key: str) -> str:
+    """이 키로 실제 generateContent를 지원하는 flash 계열 모델명을 찾는다.
+    계정/리전마다 접근 가능한 모델이 달라(가끔 gemini-2.5-flash가 404) 하드코딩 대신
+    ListModels로 탐색한다. 실패하면 선호 모델명으로 폴백한다."""
+    if "m" in _MODEL_CACHE:
+        return _MODEL_CACHE["m"]
+    model = GEMINI_PREFERRED
+    try:
+        r = requests.get(f"{GEMINI_BASE}/models", params={"key": api_key}, timeout=20)
+        r.raise_for_status()
+        names = [
+            m["name"].split("/")[-1]
+            for m in r.json().get("models", [])
+            if "generateContent" in (m.get("supportedGenerationMethods") or [])
+            and "flash" in m["name"].lower()
+            and "vision" not in m["name"].lower()
+        ]
+
+        def score(n: str) -> int:
+            s = 0
+            if "2.5" in n:
+                s += 100
+            elif "2.0" in n:
+                s += 50
+            elif "1.5" in n:
+                s += 20
+            if n.endswith("flash"):
+                s += 5
+            if "latest" in n:
+                s += 3
+            if "preview" in n or "exp" in n:
+                s -= 10
+            return s
+
+        names.sort(key=score, reverse=True)
+        if names:
+            model = names[0]
+            print(f"  Gemini 모델: {model}  (후보: {', '.join(names[:5])})")
+    except Exception as e:
+        print(f"  모델 목록 조회 실패({e}) → 기본값 {model} 사용", file=sys.stderr)
+    _MODEL_CACHE["m"] = model
+    return model
+
+
 def gemini_ocr_items(image_url: str, api_key: str):
     img = requests.get(image_url.replace("http://", "https://"),
                        headers={"User-Agent": MOBILE_UA, "Referer": "https://pf.kakao.com/"}, timeout=20)
@@ -107,8 +154,11 @@ def gemini_ocr_items(image_url: str, api_key: str):
         ]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
     }
-    r = requests.post(GEMINI_URL, params={"key": api_key}, json=body, timeout=40)
-    r.raise_for_status()
+    model = resolve_model(api_key)
+    url = f"{GEMINI_BASE}/models/{model}:generateContent"
+    r = requests.post(url, params={"key": api_key}, json=body, timeout=40)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
     data = r.json()
     text = data["candidates"][0]["content"]["parts"][0]["text"]
     parsed = json.loads(text)
