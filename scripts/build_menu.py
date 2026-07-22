@@ -27,6 +27,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+from google import genai
+from google.genai import types
 
 CHANNEL_ID = "_xoxcxcxen"
 LABEL = "에이스타워 한식뷔페"
@@ -38,8 +40,7 @@ MOBILE_UA = (
     "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
-GEMINI_PREFERRED = "gemini-2.5-flash"  # 이 키에서 접근 불가(404)면 아래 resolve_model이 대체 모델을 찾는다.
+GEMINI_MODEL = "gemini-2.5-flash"  # gbsa-cafeteria-menu(브라이언씨)가 쓰는 것과 동일
 GEMINI_SYSTEM = "당신은 한국 구내식당 메뉴판 이미지를 읽어 메뉴 항목만 정확히 추출하는 도우미입니다. 이미지에 없는 메뉴를 추측해서 지어내지 마세요."
 GEMINI_PROMPT = (
     "이 이미지는 어느 구내식당의 '오늘의 메뉴' 한 끼 메뉴판입니다. 메뉴 항목들을 이미지에 적힌 그대로 정확히 뽑아 "
@@ -94,74 +95,25 @@ def text_items(item):
     return [s.strip() for s in text.splitlines() if s.strip()]
 
 
-_MODEL_CACHE = {}
-
-
-def resolve_model(api_key: str) -> str:
-    """이 키로 실제 generateContent를 지원하는 flash 계열 모델명을 찾는다.
-    계정/리전마다 접근 가능한 모델이 달라(가끔 gemini-2.5-flash가 404) 하드코딩 대신
-    ListModels로 탐색한다. 실패하면 선호 모델명으로 폴백한다."""
-    if "m" in _MODEL_CACHE:
-        return _MODEL_CACHE["m"]
-    model = GEMINI_PREFERRED
-    try:
-        r = requests.get(f"{GEMINI_BASE}/models", params={"key": api_key}, timeout=20)
-        r.raise_for_status()
-        names = [
-            m["name"].split("/")[-1]
-            for m in r.json().get("models", [])
-            if "generateContent" in (m.get("supportedGenerationMethods") or [])
-            and "flash" in m["name"].lower()
-            and "vision" not in m["name"].lower()
-        ]
-
-        def score(n: str) -> int:
-            s = 0
-            if "2.5" in n:
-                s += 100
-            elif "2.0" in n:
-                s += 50
-            elif "1.5" in n:
-                s += 20
-            if n.endswith("flash"):
-                s += 5
-            if "latest" in n:
-                s += 3
-            if "preview" in n or "exp" in n:
-                s -= 10
-            return s
-
-        names.sort(key=score, reverse=True)
-        if names:
-            model = names[0]
-            print(f"  Gemini 모델: {model}  (후보: {', '.join(names[:5])})")
-    except Exception as e:
-        print(f"  모델 목록 조회 실패({e}) → 기본값 {model} 사용", file=sys.stderr)
-    _MODEL_CACHE["m"] = model
-    return model
-
-
-def gemini_ocr_items(image_url: str, api_key: str):
+def gemini_ocr_items(image_url: str, client: "genai.Client"):
+    # gbsa-cafeteria-menu(브라이언씨)와 동일하게 google-genai SDK로 호출한다.
+    # (raw REST는 계정에 따라 404가 나서, SDK가 엔드포인트/모델을 알아서 처리하게 맡긴다.)
     img = requests.get(image_url.replace("http://", "https://"),
                        headers={"User-Agent": MOBILE_UA, "Referer": "https://pf.kakao.com/"}, timeout=20)
     img.raise_for_status()
-    b64 = base64.b64encode(img.content).decode("ascii")
-    body = {
-        "systemInstruction": {"parts": [{"text": GEMINI_SYSTEM}]},
-        "contents": [{"parts": [
-            {"text": GEMINI_PROMPT},
-            {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
-        ]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
-    }
-    model = resolve_model(api_key)
-    url = f"{GEMINI_BASE}/models/{model}:generateContent"
-    r = requests.post(url, params={"key": api_key}, json=body, timeout=40)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    parsed = json.loads(text)
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            types.Part.from_bytes(data=img.content, mime_type="image/jpeg"),
+            GEMINI_PROMPT,
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=GEMINI_SYSTEM,
+            response_mime_type="application/json",
+            temperature=0,
+        ),
+    )
+    parsed = json.loads((response.text or "").strip())
     return [str(s).strip() for s in parsed.get("items", []) if str(s).strip()]
 
 
@@ -187,6 +139,7 @@ def main():
     if not api_key:
         print("ERROR: GEMINI_API_KEY 환경변수가 없습니다 (GitHub Actions Secret에 등록하세요).", file=sys.stderr)
         sys.exit(1)
+    client = genai.Client(api_key=api_key)
 
     now = datetime.now(KST)
     items = fetch_posts()
@@ -232,7 +185,7 @@ def main():
                     lunch_items = prev
                 elif lunch["image"]:
                     try:
-                        lunch_items = gemini_ocr_items(lunch["image"], api_key)
+                        lunch_items = gemini_ocr_items(lunch["image"], client)
                         ocr_calls += 1
                         print(f"  [{date_key}] 중식 OCR: {len(lunch_items)}개")
                     except Exception as e:
