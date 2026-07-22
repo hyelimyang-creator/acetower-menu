@@ -95,26 +95,77 @@ def text_items(item):
     return [s.strip() for s in text.splitlines() if s.strip()]
 
 
+_WORKING_MODEL = {}
+
+
+def _model_score(name: str) -> int:
+    s = 0
+    mm = re.search(r"(\d+)\.(\d+)", name)
+    if mm:
+        s += int(mm.group(1)) * 100 + int(mm.group(2)) * 10
+    if name.endswith("flash"):
+        s += 5
+    if "latest" in name:
+        s += 3
+    if "lite" in name:
+        s -= 2
+    if "preview" in name or "exp" in name:
+        s -= 30  # 안정 버전 우선
+    return s
+
+
+def candidate_models(client: "genai.Client"):
+    """이 키로 쓸 수 있는 flash 계열 모델을 최신·안정 우선으로 정렬해 반환한다.
+    (gemini-2.5-flash는 신규 계정에 막혀 있어, 하드코딩 대신 실제 가용 모델을 쓴다.)"""
+    try:
+        names = []
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").split("/")[-1]
+            acts = getattr(m, "supported_actions", None)
+            low = name.lower()
+            if "flash" not in low or "vision" in low or "image" in low or "tts" in low:
+                continue
+            if acts and "generateContent" not in acts:
+                continue
+            names.append(name)
+        names = sorted(set(names), key=_model_score, reverse=True)
+        return names or [GEMINI_MODEL]
+    except Exception as e:
+        print(f"  모델 목록 조회 실패({e}) → 기본값 사용", file=sys.stderr)
+        return [GEMINI_MODEL]
+
+
 def gemini_ocr_items(image_url: str, client: "genai.Client"):
     # gbsa-cafeteria-menu(브라이언씨)와 동일하게 google-genai SDK로 호출한다.
-    # (raw REST는 계정에 따라 404가 나서, SDK가 엔드포인트/모델을 알아서 처리하게 맡긴다.)
+    # 단, 이 키가 실제 쓸 수 있는 모델을 골라 404(신규 계정 차단)를 피한다.
     img = requests.get(image_url.replace("http://", "https://"),
                        headers={"User-Agent": MOBILE_UA, "Referer": "https://pf.kakao.com/"}, timeout=20)
     img.raise_for_status()
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            types.Part.from_bytes(data=img.content, mime_type="image/jpeg"),
-            GEMINI_PROMPT,
-        ],
-        config=types.GenerateContentConfig(
-            system_instruction=GEMINI_SYSTEM,
-            response_mime_type="application/json",
-            temperature=0,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=GEMINI_SYSTEM,
+        response_mime_type="application/json",
+        temperature=0,
     )
-    parsed = json.loads((response.text or "").strip())
-    return [str(s).strip() for s in parsed.get("items", []) if str(s).strip()]
+    contents = [
+        types.Part.from_bytes(data=img.content, mime_type="image/jpeg"),
+        GEMINI_PROMPT,
+    ]
+    models = [_WORKING_MODEL["m"]] if "m" in _WORKING_MODEL else candidate_models(client)
+    last_err = None
+    for name in models:
+        try:
+            response = client.models.generate_content(model=name, contents=contents, config=config)
+            if "m" not in _WORKING_MODEL:
+                _WORKING_MODEL["m"] = name
+                print(f"  Gemini 모델: {name}")
+            parsed = json.loads((response.text or "").strip())
+            return [str(s).strip() for s in parsed.get("items", []) if str(s).strip()]
+        except Exception as e:
+            last_err = e
+            if "404" in str(e) or "NOT_FOUND" in str(e):
+                continue  # 이 모델은 이 키로 못 씀 → 다음 후보
+            raise
+    raise last_err if last_err else RuntimeError("사용 가능한 Gemini 모델을 찾지 못함")
 
 
 def load_existing():
