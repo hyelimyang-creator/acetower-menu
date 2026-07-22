@@ -1,7 +1,4 @@
-line1
-  indented2
-    deeper3
-back0"""
+"""
 에이스타워 한식뷔페(카카오채널 _xoxcxcxen) 급식 데이터 생성 서비스.
 
 브라이언씨의 gbsa-cafeteria-menu 크롤러와 같은 역할이지만, 이 채널은 카카오 JSON API가
